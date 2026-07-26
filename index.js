@@ -22,10 +22,7 @@ if (!SUPABASE_SECRET_KEY) {
   process.exit(1);
 }
 
-if (!WEBHOOK_SECRET) {
-  console.error("❌ WEBHOOK_SECRET 환경변수가 없습니다.");
-  process.exit(1);
-}
+
 
 const supabase = createClient(
   SUPABASE_URL,
@@ -118,19 +115,7 @@ app.get("/health", async (req, res) => {
  */
 app.post("/webhook", async (req, res) => {
   try {
-    const receivedSecret = req.get("x-webhook-secret");
-
-    /**
-     * 웹훅 비밀키 확인
-     */
-    if (!receivedSecret || receivedSecret !== WEBHOOK_SECRET) {
-      console.warn("⚠️ 인증되지 않은 웹훅 요청:", req.ip);
-
-      return res.status(401).json({
-        success: false,
-        message: "웹훅 인증에 실패했습니다.",
-      });
-    }
+    
 
     const payload = req.body;
 

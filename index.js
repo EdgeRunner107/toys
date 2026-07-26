@@ -577,27 +577,24 @@ app.post("/webhook", async (req, res) => {
     ------------------------------------------------------- */
 
     const { data, error } = await supabase
-      .from("webhook_logs")
-      .insert([
-        {
-          event_type: String(eventType),
-
-          // 웹훅으로 받은 원본 JSON
-          payload,
-
-          // 예: 10000
-          deposit_amount: depositAmount,
-
-          // 예: 지니/문어플
-          deposit_text: depositText,
-
-          request_headers: requestHeaders,
-          sender_ip: senderIp,
-          processed: false,
-        },
-      ])
-      .select()
-      .single();
+           .from("webhook_logs")
+           .insert([
+             {
+               event_type: String(eventType),
+               payload,
+               deposit_amount: depositAmount,
+               deposit_text: depositText,
+         
+               // 시그 실행 여부
+               signature_executed: false,
+         
+               request_headers: requestHeaders,
+               sender_ip: senderIp,
+               processed: false,
+             },
+           ])
+           .select()
+           .single();
 
     if (error) {
       console.error("❌ Supabase 저장 오류:", error);

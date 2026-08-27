@@ -4,7 +4,7 @@ const express = require("express");
 const cors = require("cors");
 const WebSocket = require("ws");
 const { createClient } = require("@supabase/supabase-js");
-
+const crypto = require("crypto");
 const app = express();
 
 /* =========================================================
@@ -349,7 +349,471 @@ function parseDepositMessage(inputText) {
   return result;
 }
 
+
+
+
+
 /* =========================================================
+   Weflab 데이터 설정
+========================================================= */
+
+const WEFLAB_INSERT_BATCH_SIZE = 500;
+const WEFLAB_DEFAULT_PAGE_SIZE = 500;
+const WEFLAB_MAX_PAGE_SIZE = 1000;
+
+
+/* =========================================================
+   Weflab 닉네임 파싱
+========================================================= */
+
+function parseWeflabNickname(value) {
+  if (value === null || value === undefined) {
+    return "";
+  }
+
+  let text = String(value)
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .trim();
+
+  if (!text) {
+    return "";
+  }
+
+  const lines = text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  /*
+   * 예:
+   *
+   * 근이는하리★
+   * (ldgcd)
+   *
+   * ↓
+   *
+   * 근이는하리★
+   */
+  if (lines.length >= 2) {
+    const lastLine =
+      lines[lines.length - 1];
+
+    if (/^\([^()]+\)$/.test(lastLine)) {
+      return lines
+        .slice(0, -1)
+        .join(" ")
+        .trim();
+    }
+  }
+
+  /*
+   * 줄바꿈 없이
+   *
+   * 근이는하리★ (ldgcd)
+   *
+   * 형태로 들어온 경우
+   */
+  return text
+    .replace(/\s*\([^()]+\)\s*$/, "")
+    .trim();
+}
+
+
+/* =========================================================
+   Weflab 숫자 변환
+========================================================= */
+
+function parseWeflabAmount(value) {
+  if (
+    value === null ||
+    value === undefined ||
+    value === ""
+  ) {
+    return null;
+  }
+
+  if (
+    typeof value === "number" &&
+    Number.isFinite(value)
+  ) {
+    const parsed =
+      Math.trunc(value);
+
+    return Number.isSafeInteger(parsed)
+      ? parsed
+      : null;
+  }
+
+  const text =
+    String(value).trim();
+
+  if (!text) {
+    return null;
+  }
+
+  /*
+   * 구독:
+   *
+   * 1개월
+   *
+   * 은 점수 숫자로 저장하지 않음
+   */
+  if (/^\d+\s*개월$/i.test(text)) {
+    return null;
+  }
+
+  const match =
+    text.match(/-?\d[\d,]*/);
+
+  if (!match) {
+    return null;
+  }
+
+  const parsed =
+    Number(
+      match[0].replace(/,/g, "")
+    );
+
+  if (!Number.isSafeInteger(parsed)) {
+    return null;
+  }
+
+  return parsed;
+}
+
+
+/* =========================================================
+   마지막 숫자 찾기
+========================================================= */
+
+function extractLastWeflabNumber(row) {
+  /*
+   * 먼저 자주 사용할 컬럼명 확인
+   */
+  const knownKeys = [
+    "amount",
+    "score",
+    "last_number",
+    "lastNumber",
+    "마지막숫자",
+    "마지막 숫자",
+    "점수",
+    "후원수",
+  ];
+
+  for (const key of knownKeys) {
+    if (
+      Object.prototype.hasOwnProperty.call(
+        row,
+        key
+      )
+    ) {
+      const amount =
+        parseWeflabAmount(
+          row[key]
+        );
+
+      if (amount !== null) {
+        return amount;
+      }
+    }
+  }
+
+
+  /*
+   * 컬럼명이 애매한 경우
+   * 객체 맨 마지막부터 숫자를 찾음
+   */
+  const entries =
+    Object.entries(row);
+
+  for (
+    let index = entries.length - 1;
+    index >= 0;
+    index -= 1
+  ) {
+    const [key, value] =
+      entries[index];
+
+    /*
+     * 아래 컬럼들은 마지막 숫자 탐색에서 제외
+     */
+    if (
+      key === "시간" ||
+      key === "time" ||
+      key === "event_time" ||
+      key === "후원,구독" ||
+      key === "후원" ||
+      key === "donation"
+    ) {
+      continue;
+    }
+
+
+    if (
+      typeof value === "number" &&
+      Number.isFinite(value)
+    ) {
+      const parsed =
+        Math.trunc(value);
+
+      if (
+        Number.isSafeInteger(parsed)
+      ) {
+        return parsed;
+      }
+    }
+
+
+    /*
+     * 문자열인데 순수 숫자인 경우
+     *
+     * "1,169"
+     * "1169"
+     */
+    if (
+      typeof value === "string" &&
+      /^-?[\d,]+$/.test(
+        value.trim()
+      )
+    ) {
+      const amount =
+        parseWeflabAmount(value);
+
+      if (amount !== null) {
+        return amount;
+      }
+    }
+  }
+
+  return null;
+}
+
+
+/* =========================================================
+   시간 정리
+========================================================= */
+
+function normalizeWeflabEventTime(value) {
+  if (
+    value === null ||
+    value === undefined
+  ) {
+    return null;
+  }
+
+  const text =
+    String(value).trim();
+
+  if (!text) {
+    return null;
+  }
+
+  /*
+   * 예:
+   * 2026-03-27 16:26:30
+   */
+  const match =
+    text.match(
+      /^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2})(?::(\d{2}))?$/
+    );
+
+  if (!match) {
+    return text;
+  }
+
+  const seconds =
+    match[6] || "00";
+
+  return (
+    `${match[1]}-${match[2]}-${match[3]} ` +
+    `${match[4]}:${match[5]}:${seconds}`
+  );
+}
+
+
+/* =========================================================
+   중복 방지 키 생성
+========================================================= */
+
+function createWeflabDedupeKey({
+  eventTime,
+  nickname,
+  text,
+  amount,
+}) {
+  const normalized =
+    JSON.stringify([
+      eventTime || "",
+      nickname || "",
+      text || "",
+      amount === null ||
+      amount === undefined
+        ? ""
+        : String(amount),
+    ]);
+
+  return crypto
+    .createHash("sha256")
+    .update(
+      normalized,
+      "utf8"
+    )
+    .digest("hex");
+}
+
+
+/* =========================================================
+   Weflab 한 행 변환
+========================================================= */
+
+function parseWeflabRow(row) {
+  if (
+    !row ||
+    typeof row !== "object" ||
+    Array.isArray(row)
+  ) {
+    return {
+      valid: false,
+      reason: "객체 형식이 아닙니다.",
+      data: null,
+    };
+  }
+
+
+  /* 시간 */
+
+  const eventTime =
+    normalizeWeflabEventTime(
+      row["시간"] ??
+      row.time ??
+      row.event_time ??
+      row.datetime ??
+      null
+    );
+
+
+  /* 닉네임 */
+
+  const originalName =
+    row["이름"] ??
+    row.nickname ??
+    row.name ??
+    "";
+
+  const nickname =
+    parseWeflabNickname(
+      originalName
+    );
+
+
+  /* 채팅 */
+
+  const chatValue =
+    row["채팅"] ??
+    row.text ??
+    row.chat ??
+    row.message ??
+    null;
+
+  const text =
+    chatValue === null ||
+    chatValue === undefined
+      ? null
+      : String(chatValue).trim();
+
+
+  /* 마지막 숫자 */
+
+  const amount =
+    extractLastWeflabNumber(
+      row
+    );
+
+
+  if (!eventTime) {
+    return {
+      valid: false,
+      reason: "시간이 없습니다.",
+      data: null,
+    };
+  }
+
+
+  if (!nickname) {
+    return {
+      valid: false,
+      reason: "닉네임이 없습니다.",
+      data: null,
+    };
+  }
+
+
+  const dedupeKey =
+    createWeflabDedupeKey({
+      eventTime,
+      nickname,
+      text,
+      amount,
+    });
+
+
+  return {
+    valid: true,
+
+    data: {
+      event_time: eventTime,
+      nickname,
+      text,
+      amount,
+      dedupe_key: dedupeKey,
+    },
+  };
+}
+
+
+/* =========================================================
+   배열 500개씩 나누기
+========================================================= */
+
+function chunkArray(items, size) {
+  const chunks = [];
+
+  for (
+    let index = 0;
+    index < items.length;
+    index += size
+  ) {
+    chunks.push(
+      items.slice(
+        index,
+        index + size
+      )
+    );
+  }
+
+  return chunks;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/* ======================================
+===================
    클라이언트 IP 확인
 ========================================================= */
 
@@ -823,6 +1287,823 @@ app.patch(
     }
   }
 );
+
+
+
+
+
+
+/* =========================================================
+   Weflab 데이터 저장 API
+========================================================= */
+
+/*
+ * POST /weflab-data
+ *
+ * 지원:
+ *
+ * [
+ *   {...},
+ *   {...}
+ * ]
+ *
+ * 또는
+ *
+ * {
+ *   "data": [...]
+ * }
+ */
+
+app.post(
+  "/weflab-data",
+  async (req, res) => {
+    try {
+      const body =
+        req.body;
+
+      let rows = [];
+
+
+      /* ---------------------------------------
+         요청 데이터 형식 확인
+      --------------------------------------- */
+
+      if (Array.isArray(body)) {
+        rows = body;
+      }
+
+      else if (
+        body &&
+        Array.isArray(body.data)
+      ) {
+        rows =
+          body.data;
+      }
+
+      else if (
+        body &&
+        typeof body === "object"
+      ) {
+        rows = [body];
+      }
+
+      else {
+        return res.status(400).json({
+          success: false,
+          message:
+            "JSON 객체 또는 배열을 보내주세요.",
+        });
+      }
+
+
+      if (rows.length === 0) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "저장할 데이터가 없습니다.",
+        });
+      }
+
+
+      /* ---------------------------------------
+         데이터 변환
+      --------------------------------------- */
+
+      const parsedRows = [];
+
+      const skippedRows = [];
+
+
+      for (
+        let index = 0;
+        index < rows.length;
+        index += 1
+      ) {
+        const result =
+          parseWeflabRow(
+            rows[index]
+          );
+
+
+        if (!result.valid) {
+          skippedRows.push({
+            index,
+            reason:
+              result.reason,
+          });
+
+          continue;
+        }
+
+
+        parsedRows.push(
+          result.data
+        );
+      }
+
+
+      if (
+        parsedRows.length === 0
+      ) {
+        return res.status(400).json({
+          success: false,
+
+          message:
+            "저장 가능한 데이터가 없습니다.",
+
+          received:
+            rows.length,
+
+          skipped:
+            skippedRows.length,
+
+          skippedRows,
+        });
+      }
+
+
+      /* ---------------------------------------
+         요청 내부 중복 제거
+      --------------------------------------- */
+
+      const uniqueMap =
+        new Map();
+
+
+      for (
+        const row of parsedRows
+      ) {
+        uniqueMap.set(
+          row.dedupe_key,
+          row
+        );
+      }
+
+
+      const uniqueRows =
+        Array.from(
+          uniqueMap.values()
+        );
+
+
+      /* ---------------------------------------
+         500개씩 분할
+      --------------------------------------- */
+
+      const batches =
+        chunkArray(
+          uniqueRows,
+          WEFLAB_INSERT_BATCH_SIZE
+        );
+
+
+      let processedCount = 0;
+
+      let insertedCount = 0;
+
+      const batchResults = [];
+
+
+      /* ---------------------------------------
+         Supabase 저장
+      --------------------------------------- */
+
+      for (
+        let batchIndex = 0;
+        batchIndex < batches.length;
+        batchIndex += 1
+      ) {
+        const batch =
+          batches[batchIndex];
+
+
+        const {
+          data,
+          error,
+        } = await supabase
+
+          .from(
+            "weflab_donations"
+          )
+
+          .upsert(
+            batch,
+            {
+              onConflict:
+                "dedupe_key",
+
+              ignoreDuplicates:
+                true,
+            }
+          )
+
+          .select(
+            "id,event_time,nickname,text,amount,created_at"
+          );
+
+
+        if (error) {
+          console.error(
+            `❌ Weflab 배치 ${
+              batchIndex + 1
+            } 저장 실패:`,
+            error
+          );
+
+
+          return res
+            .status(500)
+            .json({
+              success: false,
+
+              message:
+                "Weflab 데이터 저장 중 오류가 발생했습니다.",
+
+              batch:
+                batchIndex + 1,
+
+              processedBeforeError:
+                processedCount,
+
+              error:
+                error.message,
+
+              details:
+                error.details ||
+                null,
+
+              hint:
+                error.hint ||
+                null,
+
+              code:
+                error.code ||
+                null,
+            });
+        }
+
+
+        processedCount +=
+          batch.length;
+
+
+        const returnedCount =
+          Array.isArray(data)
+            ? data.length
+            : 0;
+
+
+        insertedCount +=
+          returnedCount;
+
+
+        batchResults.push({
+          batch:
+            batchIndex + 1,
+
+          requested:
+            batch.length,
+
+          returned:
+            returnedCount,
+        });
+      }
+
+
+      console.log(
+        "✅ Weflab 저장 완료",
+        {
+          received:
+            rows.length,
+
+          valid:
+            parsedRows.length,
+
+          unique:
+            uniqueRows.length,
+
+          processed:
+            processedCount,
+
+          inserted:
+            insertedCount,
+
+          skipped:
+            skippedRows.length,
+        }
+      );
+
+
+      return res
+        .status(201)
+        .json({
+          success: true,
+
+          message:
+            "Weflab 데이터를 저장했습니다.",
+
+          received:
+            rows.length,
+
+          valid:
+            parsedRows.length,
+
+          unique:
+            uniqueRows.length,
+
+          processed:
+            processedCount,
+
+          inserted:
+            insertedCount,
+
+          batches:
+            batches.length,
+
+          skipped:
+            skippedRows.length,
+
+          skippedRows,
+
+          batchResults,
+        });
+
+    } catch (error) {
+      console.error(
+        "❌ Weflab 저장 오류:",
+        error
+      );
+
+
+      return res
+        .status(500)
+        .json({
+          success: false,
+
+          message:
+            "Weflab 데이터 처리 중 오류가 발생했습니다.",
+
+          error:
+            error.message,
+        });
+    }
+  }
+);
+
+
+/* =========================================================
+   Weflab 데이터 페이지 조회
+========================================================= */
+
+/*
+ * GET /weflab-data
+ *
+ * 예:
+ *
+ * /weflab-data?page=1&limit=500
+ * /weflab-data?page=2&limit=500
+ */
+
+app.get(
+  "/weflab-data",
+  async (req, res) => {
+    try {
+      const requestedPage =
+        Number(
+          req.query.page
+        ) || 1;
+
+
+      const requestedLimit =
+        Number(
+          req.query.limit
+        ) ||
+        WEFLAB_DEFAULT_PAGE_SIZE;
+
+
+      const page =
+        Math.max(
+          Number.isSafeInteger(
+            requestedPage
+          )
+            ? requestedPage
+            : 1,
+          1
+        );
+
+
+      /*
+       * 한 페이지 최대 1000개
+       */
+      const limit =
+        Math.min(
+          Math.max(
+            Number.isSafeInteger(
+              requestedLimit
+            )
+              ? requestedLimit
+              : WEFLAB_DEFAULT_PAGE_SIZE,
+            1
+          ),
+
+          WEFLAB_MAX_PAGE_SIZE
+        );
+
+
+      const from =
+        (page - 1) *
+        limit;
+
+
+      const to =
+        from +
+        limit -
+        1;
+
+
+      const {
+        data,
+        error,
+        count,
+      } = await supabase
+
+        .from(
+          "weflab_donations"
+        )
+
+        .select(
+          "id,event_time,nickname,text,amount,created_at",
+          {
+            count: "exact",
+          }
+        )
+
+        /*
+         * 시간순
+         */
+        .order(
+          "event_time",
+          {
+            ascending:
+              true,
+          }
+        )
+
+        /*
+         * 같은 시간일 경우 ID 순
+         */
+        .order(
+          "id",
+          {
+            ascending:
+              true,
+          }
+        )
+
+        .range(
+          from,
+          to
+        );
+
+
+      if (error) {
+        throw error;
+      }
+
+
+      const total =
+        typeof count ===
+        "number"
+          ? count
+          : 0;
+
+
+      const totalPages =
+        total === 0
+          ? 0
+          : Math.ceil(
+              total /
+              limit
+            );
+
+
+      return res
+        .status(200)
+        .json({
+          success: true,
+
+          page,
+
+          limit,
+
+          count:
+            data?.length ||
+            0,
+
+          total,
+
+          totalPages,
+
+          hasNextPage:
+            page <
+            totalPages,
+
+          hasPreviousPage:
+            page > 1,
+
+          data:
+            data || [],
+        });
+
+    } catch (error) {
+      console.error(
+        "❌ Weflab 조회 오류:",
+        error
+      );
+
+
+      return res
+        .status(500)
+        .json({
+          success: false,
+
+          message:
+            "Weflab 데이터 조회에 실패했습니다.",
+
+          error:
+            error.message,
+        });
+    }
+  }
+);
+
+
+/* =========================================================
+   Weflab 전체 데이터 조회
+========================================================= */
+
+/*
+ * GET /weflab-data/all
+ *
+ * DB에서 1000개씩 반복해서 전체 조회합니다.
+ */
+
+app.get(
+  "/weflab-data/all",
+  async (req, res) => {
+    try {
+      const batchSize =
+        1000;
+
+      let from = 0;
+
+      let allData = [];
+
+
+      while (true) {
+        const to =
+          from +
+          batchSize -
+          1;
+
+
+        const {
+          data,
+          error,
+        } = await supabase
+
+          .from(
+            "weflab_donations"
+          )
+
+          .select(
+            "id,event_time,nickname,text,amount,created_at"
+          )
+
+          .order(
+            "event_time",
+            {
+              ascending:
+                true,
+            }
+          )
+
+          .order(
+            "id",
+            {
+              ascending:
+                true,
+            }
+          )
+
+          .range(
+            from,
+            to
+          );
+
+
+        if (error) {
+          throw error;
+        }
+
+
+        const rows =
+          data || [];
+
+
+        allData =
+          allData.concat(
+            rows
+          );
+
+
+        /*
+         * 1000개보다 적게 왔다 =
+         * 마지막 페이지
+         */
+        if (
+          rows.length <
+          batchSize
+        ) {
+          break;
+        }
+
+
+        from +=
+          batchSize;
+
+
+        /*
+         * 메모리 보호
+         */
+        if (
+          allData.length >=
+          100000
+        ) {
+          return res
+            .status(413)
+            .json({
+              success: false,
+
+              message:
+                "데이터가 100,000개 이상입니다. 페이지 조회를 사용해주세요.",
+
+              loaded:
+                allData.length,
+            });
+        }
+      }
+
+
+      return res
+        .status(200)
+        .json({
+          success: true,
+
+          count:
+            allData.length,
+
+          data:
+            allData,
+        });
+
+    } catch (error) {
+      console.error(
+        "❌ Weflab 전체 조회 오류:",
+        error
+      );
+
+
+      return res
+        .status(500)
+        .json({
+          success: false,
+
+          message:
+            "Weflab 전체 데이터 조회에 실패했습니다.",
+
+          error:
+            error.message,
+        });
+    }
+  }
+);
+
+
+/* =========================================================
+   Weflab 특정 데이터 조회
+========================================================= */
+
+app.get(
+  "/weflab-data/:id",
+  async (req, res) => {
+    try {
+      const id =
+        Number(
+          req.params.id
+        );
+
+
+      if (
+        !Number.isSafeInteger(id) ||
+        id <= 0
+      ) {
+        return res
+          .status(400)
+          .json({
+            success: false,
+
+            message:
+              "올바른 ID가 아닙니다.",
+          });
+      }
+
+
+      const {
+        data,
+        error,
+      } = await supabase
+
+        .from(
+          "weflab_donations"
+        )
+
+        .select(
+          "id,event_time,nickname,text,amount,created_at"
+        )
+
+        .eq(
+          "id",
+          id
+        )
+
+        .maybeSingle();
+
+
+      if (error) {
+        throw error;
+      }
+
+
+      if (!data) {
+        return res
+          .status(404)
+          .json({
+            success: false,
+
+            message:
+              "해당 Weflab 데이터를 찾을 수 없습니다.",
+          });
+      }
+
+
+      return res
+        .status(200)
+        .json({
+          success: true,
+          data,
+        });
+
+    } catch (error) {
+      console.error(
+        "❌ Weflab 상세 조회 오류:",
+        error
+      );
+
+
+      return res
+        .status(500)
+        .json({
+          success: false,
+
+          message:
+            "Weflab 상세 조회에 실패했습니다.",
+
+          error:
+            error.message,
+        });
+    }
+  }
+);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 /* =========================================================
    존재하지 않는 주소 처리

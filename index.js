@@ -1289,31 +1289,299 @@ app.patch(
 );
 
 
+/* =========================================================
+   Weflab 설정
+========================================================= */
 
+const WEFLAB_INSERT_BATCH_SIZE = 500;
+const WEFLAB_DEFAULT_PAGE_SIZE = 500;
+const WEFLAB_MAX_PAGE_SIZE = 1000;
 
 
 /* =========================================================
    Weflab 공통 함수
 ========================================================= */
 
-/**
- * 회차 추출
- *
- * 지원:
- * {
- *   round: "ARTS1회차"
- * }
- *
- * {
- *   회차: "ARTS1회차"
- * }
- *
- * {
- *   회차명: "ARTS1회차"
- * }
- *
- * 엑셀 마지막 컬럼에 ARTS1회차가 있을 경우도 보조적으로 탐색
- */
+
+/* ---------------------------------------------------------
+   문자열 정리
+--------------------------------------------------------- */
+
+function cleanWeflabString(value) {
+  if (
+    value === null ||
+    value === undefined
+  ) {
+    return "";
+  }
+
+  return String(value).trim();
+}
+
+
+/* ---------------------------------------------------------
+   시간 변환
+
+   지원:
+   2026-03-27 16:26:30
+   2026-03-27T16:26:30
+   Excel Date 객체
+--------------------------------------------------------- */
+
+function normalizeWeflabEventTime(value) {
+  if (
+    value === null ||
+    value === undefined ||
+    value === ""
+  ) {
+    return null;
+  }
+
+
+  /*
+   * Date 객체
+   */
+
+  if (
+    value instanceof Date &&
+    !Number.isNaN(value.getTime())
+  ) {
+
+    const year =
+      value.getFullYear();
+
+    const month =
+      String(
+        value.getMonth() + 1
+      ).padStart(2, "0");
+
+    const day =
+      String(
+        value.getDate()
+      ).padStart(2, "0");
+
+    const hour =
+      String(
+        value.getHours()
+      ).padStart(2, "0");
+
+    const minute =
+      String(
+        value.getMinutes()
+      ).padStart(2, "0");
+
+    const second =
+      String(
+        value.getSeconds()
+      ).padStart(2, "0");
+
+
+    return (
+      `${year}-${month}-${day} ` +
+      `${hour}:${minute}:${second}`
+    );
+  }
+
+
+  let text =
+    String(value)
+      .replace(/\u00a0/g, " ")
+      .trim();
+
+
+  /*
+   * T 형식도 DB timestamp 형식으로
+   */
+
+  text =
+    text.replace(
+      /^(\d{4}-\d{2}-\d{2})T/,
+      "$1 "
+    );
+
+
+  /*
+   * 공백 여러 개 제거
+   */
+
+  text =
+    text.replace(
+      /\s+/g,
+      " "
+    );
+
+
+  /*
+   * YYYY-MM-DD HH:mm:ss
+   */
+
+  const match =
+    text.match(
+      /^(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2}):(\d{2})/
+    );
+
+
+  if (match) {
+
+    const hour =
+      String(match[2])
+        .padStart(2, "0");
+
+
+    return (
+      `${match[1]} ` +
+      `${hour}:${match[3]}:${match[4]}`
+    );
+
+  }
+
+
+  return null;
+}
+
+
+/* ---------------------------------------------------------
+   닉네임 정리
+
+   입력:
+   근이는하리★<br>(ldgcd)
+
+   결과:
+   근이는하리★
+--------------------------------------------------------- */
+
+function parseWeflabNickname(value) {
+  if (
+    value === null ||
+    value === undefined
+  ) {
+    return "";
+  }
+
+
+  let text =
+    String(value);
+
+
+  /*
+   * HTML <br>
+   */
+
+  text =
+    text.replace(
+      /<br\s*\/?>/gi,
+      "\n"
+    );
+
+
+  /*
+   * 첫 줄만 닉네임으로 사용
+   */
+
+  let nickname =
+    text
+      .split(/\r?\n/)
+      [0]
+      .trim();
+
+
+  /*
+   * 혹시 한 줄 형태
+   * 닉네임 (userid)
+   */
+
+  nickname =
+    nickname.replace(
+      /\s*\([^()]+\)\s*$/,
+      ""
+    );
+
+
+  return nickname.trim();
+}
+
+
+/* ---------------------------------------------------------
+   숫자 파싱
+
+   1,015개 -> 1015
+   100개   -> 100
+   1015    -> 1015
+   ""      -> null
+
+   "1개월"은 amount가 아니라 구독기간이므로
+   여기서는 null
+--------------------------------------------------------- */
+
+function parseWeflabAmount(value) {
+  if (
+    value === null ||
+    value === undefined ||
+    value === ""
+  ) {
+    return null;
+  }
+
+
+  const text =
+    String(value).trim();
+
+
+  if (!text) {
+    return null;
+  }
+
+
+  /*
+   * 구독 데이터
+   */
+
+  if (
+    text.includes("개월") ||
+    text.includes("구독")
+  ) {
+    return null;
+  }
+
+
+  const cleaned =
+    text.replace(
+      /[^0-9-]/g,
+      ""
+    );
+
+
+  if (!cleaned) {
+    return null;
+  }
+
+
+  const number =
+    Number(cleaned);
+
+
+  if (
+    !Number.isFinite(number)
+  ) {
+    return null;
+  }
+
+
+  return number;
+}
+
+
+/* ---------------------------------------------------------
+   회차 추출
+
+   지원:
+   round
+   회차
+   회차명
+
+   그리고 마지막 컬럼에서 "회차" 문자열 탐색
+--------------------------------------------------------- */
+
 function extractWeflabRound(row) {
   if (
     !row ||
@@ -1322,10 +1590,6 @@ function extractWeflabRound(row) {
     return "";
   }
 
-
-  /* ---------------------------------------
-     명시적인 컬럼명 우선
-  --------------------------------------- */
 
   const candidates = [
     row.round,
@@ -1336,25 +1600,29 @@ function extractWeflabRound(row) {
   ];
 
 
-  for (const value of candidates) {
+  for (
+    const value of candidates
+  ) {
+
     if (
       value !== null &&
       value !== undefined &&
       String(value).trim()
     ) {
-      return String(value).trim();
+
+      return String(value)
+        .replace(/<br\s*\/?>/gi, "")
+        .trim();
+
     }
+
   }
 
 
-  /* ---------------------------------------
-     마지막 컬럼 보조 탐색
-
-     예:
-     ARTS1회차
-     로벤저스1회차
-     1회차
-  --------------------------------------- */
+  /*
+   * 헤더가 정확하지 않은 경우
+   * 마지막 컬럼 쪽에서 회차 탐색
+   */
 
   const values =
     Object.values(row);
@@ -1365,32 +1633,30 @@ function extractWeflabRound(row) {
     i >= 0;
     i -= 1
   ) {
+
+    if (
+      values[i] === null ||
+      values[i] === undefined
+    ) {
+      continue;
+    }
+
+
     const value =
-      values[i];
+      String(values[i])
+        .replace(
+          /<br\s*\/?>/gi,
+          ""
+        )
+        .trim();
 
 
     if (
-      value === null ||
-      value === undefined
+      value.includes("회차")
     ) {
-      continue;
+      return value;
     }
 
-
-    const text =
-      String(value).trim();
-
-
-    if (!text) {
-      continue;
-    }
-
-
-    if (
-      text.includes("회차")
-    ) {
-      return text;
-    }
   }
 
 
@@ -1398,37 +1664,412 @@ function extractWeflabRound(row) {
 }
 
 
+/* ---------------------------------------------------------
+   donation_value 추출
+
+   원본:
+   후원,구독 = 1,015개
+   후원,구독 = 1개월
+--------------------------------------------------------- */
+
+function extractWeflabDonationValue(row) {
+  const candidates = [
+    row.donation_value,
+    row["후원,구독"],
+    row["후원/구독"],
+    row["후원"],
+    row.donation,
+  ];
+
+
+  for (
+    const value of candidates
+  ) {
+
+    if (
+      value !== null &&
+      value !== undefined &&
+      String(value).trim()
+    ) {
+
+      return String(value)
+        .trim();
+
+    }
+
+  }
+
+
+  return "";
+}
+
+
+/* ---------------------------------------------------------
+   멤버 추출
+--------------------------------------------------------- */
+
+function extractWeflabMember(row) {
+  const value =
+    row.member ??
+    row["멤버"] ??
+    row["스트리머"] ??
+    "";
+
+
+  return cleanWeflabString(
+    value
+  );
+}
+
+
+/* ---------------------------------------------------------
+   amount 추출
+
+   마지막숫자 우선
+   없으면 donation_value에서 추출
+
+   1개월 같은 구독은 null
+--------------------------------------------------------- */
+
+function extractWeflabAmount(
+  row,
+  donationValue
+) {
+
+  const candidates = [
+    row.amount,
+    row["마지막숫자"],
+    row["마지막 숫자"],
+    row["점수"],
+    row.score,
+  ];
+
+
+  for (
+    const value of candidates
+  ) {
+
+    if (
+      value === null ||
+      value === undefined ||
+      value === ""
+    ) {
+      continue;
+    }
+
+
+    const amount =
+      parseWeflabAmount(
+        value
+      );
+
+
+    if (
+      amount !== null
+    ) {
+      return amount;
+    }
+
+  }
+
+
+  return parseWeflabAmount(
+    donationValue
+  );
+}
+
+
+/* ---------------------------------------------------------
+   중복키 생성
+
+   회차까지 포함
+
+   회차
+   시간
+   닉네임
+   후원/구독
+   채팅
+   멤버
+   금액
+--------------------------------------------------------- */
+
+function createWeflabDedupeKey({
+  eventTime,
+  nickname,
+  donationValue,
+  text,
+  member,
+  amount,
+  round,
+}) {
+
+  return [
+    round || "",
+    eventTime || "",
+    nickname || "",
+    donationValue || "",
+    text || "",
+    member || "",
+    amount ?? "",
+  ].join("|");
+}
+
+
+/* ---------------------------------------------------------
+   Weflab 한 행 파싱
+--------------------------------------------------------- */
+
+function parseWeflabRow(row) {
+  try {
+
+    if (
+      !row ||
+      typeof row !== "object"
+    ) {
+
+      return {
+        valid: false,
+        reason:
+          "올바른 객체 데이터가 아닙니다.",
+      };
+
+    }
+
+
+    /* ==========================================
+       시간
+    ========================================== */
+
+    const rawEventTime =
+      row.event_time ??
+      row["시간"] ??
+      row.time ??
+      row.datetime;
+
+
+    const eventTime =
+      normalizeWeflabEventTime(
+        rawEventTime
+      );
+
+
+    if (!eventTime) {
+
+      return {
+        valid: false,
+        reason:
+          "시간이 없거나 형식이 올바르지 않습니다.",
+      };
+
+    }
+
+
+    /* ==========================================
+       닉네임
+    ========================================== */
+
+    const nickname =
+      parseWeflabNickname(
+        row.nickname ??
+        row["이름"] ??
+        row.name
+      );
+
+
+    if (!nickname) {
+
+      return {
+        valid: false,
+        reason:
+          "닉네임이 없습니다.",
+      };
+
+    }
+
+
+    /* ==========================================
+       후원 / 구독 원본값
+    ========================================== */
+
+    const donationValue =
+      extractWeflabDonationValue(
+        row
+      );
+
+
+    /* ==========================================
+       채팅
+    ========================================== */
+
+    const text =
+      cleanWeflabString(
+        row.text ??
+        row["채팅"] ??
+        row.message
+      );
+
+
+    /* ==========================================
+       멤버
+    ========================================== */
+
+    const member =
+      extractWeflabMember(
+        row
+      );
+
+
+    /* ==========================================
+       amount
+    ========================================== */
+
+    const amount =
+      extractWeflabAmount(
+        row,
+        donationValue
+      );
+
+
+    /*
+     * amount는 null이어도 정상입니다.
+     *
+     * 예:
+     * donation_value = "1개월"
+     * amount = null
+     */
+
+
+    /* ==========================================
+       회차
+    ========================================== */
+
+    const round =
+      extractWeflabRound(
+        row
+      );
+
+
+    if (!round) {
+
+      return {
+        valid: false,
+        reason:
+          "회차 정보가 없습니다.",
+      };
+
+    }
+
+
+    /* ==========================================
+       중복키
+    ========================================== */
+
+    const dedupeKey =
+      createWeflabDedupeKey({
+        eventTime,
+        nickname,
+        donationValue,
+        text,
+        member,
+        amount,
+        round,
+      });
+
+
+    return {
+      valid: true,
+
+      data: {
+        event_time:
+          eventTime,
+
+        nickname,
+
+        donation_value:
+          donationValue ||
+          null,
+
+        text:
+          text ||
+          null,
+
+        member:
+          member ||
+          null,
+
+        amount,
+
+        round,
+
+        dedupe_key:
+          dedupeKey,
+      },
+    };
+
+  } catch (error) {
+
+    return {
+      valid: false,
+
+      reason:
+        error?.message ||
+        "데이터 파싱 중 오류가 발생했습니다.",
+    };
+
+  }
+}
+
+
+/* ---------------------------------------------------------
+   배열 분할
+--------------------------------------------------------- */
+
+function chunkWeflabArray(
+  array,
+  size
+) {
+
+  const chunks = [];
+
+
+  for (
+    let i = 0;
+    i < array.length;
+    i += size
+  ) {
+
+    chunks.push(
+      array.slice(
+        i,
+        i + size
+      )
+    );
+
+  }
+
+
+  return chunks;
+}
+
+
 /* =========================================================
-   Weflab 데이터 저장 API
+   Weflab 데이터 저장
 ========================================================= */
 
 /*
  * POST /weflab-data
  *
- * 지원:
+ * 배열:
  *
  * [
  *   {...},
  *   {...}
  * ]
  *
- * 또는
+ * 또는:
  *
  * {
  *   "data": [...]
- * }
- *
- *
- * 예:
- *
- * {
- *   "시간": "2026-03-27 16:26:30",
- *   "이름": "근이는하리★<br>(ldgcd)",
- *   "후원,구독": "1,015개",
- *   "채팅": "달리",
- *   "멤버": "달리",
- *   "마지막숫자": 1015,
- *   "회차": "ARTS1회차"
  * }
  */
 
@@ -1445,9 +2086,9 @@ app.post(
       let rows = [];
 
 
-      /* ---------------------------------------
-         요청 데이터 형식 확인
-      --------------------------------------- */
+      /* ==========================================
+         요청 형식 확인
+      ========================================== */
 
       if (
         Array.isArray(body)
@@ -1511,9 +2152,9 @@ app.post(
       }
 
 
-      /* ---------------------------------------
-         데이터 변환
-      --------------------------------------- */
+      /* ==========================================
+         데이터 파싱
+      ========================================== */
 
       const parsedRows = [];
 
@@ -1526,30 +2167,9 @@ app.post(
         index += 1
       ) {
 
-        const sourceRow =
-          rows[index];
-
-
-        /*
-         * 기존 Weflab 파싱 함수
-         *
-         * 반환 예:
-         *
-         * {
-         *   valid: true,
-         *   data: {
-         *     event_time,
-         *     nickname,
-         *     text,
-         *     amount,
-         *     dedupe_key
-         *   }
-         * }
-         */
-
         const result =
           parseWeflabRow(
-            sourceRow
+            rows[index]
           );
 
 
@@ -1562,65 +2182,19 @@ app.post(
 
             reason:
               result.reason,
+
+            row:
+              rows[index],
           });
+
 
           continue;
 
         }
-
-
-        /* ---------------------------------------
-           회차 추출
-        --------------------------------------- */
-
-        const round =
-          extractWeflabRound(
-            sourceRow
-          );
-
-
-        if (!round) {
-
-          skippedRows.push({
-            index,
-
-            reason:
-              "회차 정보가 없습니다.",
-          });
-
-          continue;
-
-        }
-
-
-        /* ---------------------------------------
-           저장 데이터 생성
-        --------------------------------------- */
-
-        const parsedData = {
-          ...result.data,
-
-          round,
-        };
-
-
-        /*
-         * 기존 dedupe_key는
-         *
-         * 시간 + 닉네임 + 채팅 + 금액
-         *
-         * 기반이므로 다른 회차에서 똑같은 후원이
-         * 발생하면 중복으로 처리될 수 있습니다.
-         *
-         * 따라서 회차를 dedupe_key 앞에 추가합니다.
-         */
-
-        parsedData.dedupe_key =
-          `${round}|${result.data.dedupe_key}`;
 
 
         parsedRows.push(
-          parsedData
+          result.data
         );
 
       }
@@ -1650,9 +2224,9 @@ app.post(
       }
 
 
-      /* ---------------------------------------
+      /* ==========================================
          요청 내부 중복 제거
-      --------------------------------------- */
+      ========================================== */
 
       const uniqueMap =
         new Map();
@@ -1676,12 +2250,12 @@ app.post(
         );
 
 
-      /* ---------------------------------------
-         500개씩 분할
-      --------------------------------------- */
+      /* ==========================================
+         배치 분할
+      ========================================== */
 
       const batches =
-        chunkArray(
+        chunkWeflabArray(
           uniqueRows,
           WEFLAB_INSERT_BATCH_SIZE
         );
@@ -1694,9 +2268,9 @@ app.post(
       const batchResults = [];
 
 
-      /* ---------------------------------------
+      /* ==========================================
          Supabase 저장
-      --------------------------------------- */
+      ========================================== */
 
       for (
         let batchIndex = 0;
@@ -1731,16 +2305,24 @@ app.post(
           )
 
           .select(
-            "id,event_time,nickname,text,amount,round,created_at"
+            [
+              "id",
+              "event_time",
+              "nickname",
+              "donation_value",
+              "text",
+              "member",
+              "amount",
+              "round",
+              "created_at",
+            ].join(",")
           );
 
 
         if (error) {
 
           console.error(
-            `❌ Weflab 배치 ${
-              batchIndex + 1
-            } 저장 실패:`,
+            "❌ Weflab 저장 실패:",
             error
           );
 
@@ -1755,9 +2337,6 @@ app.post(
 
               batch:
                 batchIndex + 1,
-
-              processedBeforeError:
-                processedCount,
 
               error:
                 error.message,
@@ -1799,35 +2378,11 @@ app.post(
           requested:
             batch.length,
 
-          returned:
+          inserted:
             returnedCount,
         });
 
       }
-
-
-      console.log(
-        "✅ Weflab 저장 완료",
-        {
-          received:
-            rows.length,
-
-          valid:
-            parsedRows.length,
-
-          unique:
-            uniqueRows.length,
-
-          processed:
-            processedCount,
-
-          inserted:
-            insertedCount,
-
-          skipped:
-            skippedRows.length,
-        }
-      );
 
 
       return res
@@ -1853,13 +2408,13 @@ app.post(
           inserted:
             insertedCount,
 
-          batches:
-            batches.length,
-
           skipped:
             skippedRows.length,
 
           skippedRows,
+
+          batches:
+            batches.length,
 
           batchResults,
         });
@@ -1891,22 +2446,11 @@ app.post(
 
 
 /* =========================================================
-   Weflab 회차 목록 조회
+   Weflab 회차 목록
 ========================================================= */
 
 /*
  * GET /weflab-rounds
- *
- * 응답:
- *
- * {
- *   success: true,
- *   count: 2,
- *   data: [
- *     "ARTS1회차",
- *     "ARTS2회차"
- *   ]
- * }
  */
 
 app.get(
@@ -1915,19 +2459,13 @@ app.get(
 
     try {
 
-      /*
-       * Supabase/PostgREST는 기본적으로
-       * 한 요청에 최대 1000행 제한이 있을 수 있으므로
-       * 1000건씩 전체 round를 가져옵니다.
-       */
-
       const batchSize =
         1000;
 
 
       let from = 0;
 
-      let allRounds = [];
+      const allRows = [];
 
 
       while (true) {
@@ -1957,6 +2495,14 @@ app.get(
             null
           )
 
+          .order(
+            "id",
+            {
+              ascending:
+                true,
+            }
+          )
+
           .range(
             from,
             to
@@ -1972,10 +2518,9 @@ app.get(
           data || [];
 
 
-        allRounds =
-          allRounds.concat(
-            rows
-          );
+        allRows.push(
+          ...rows
+        );
 
 
         if (
@@ -1990,12 +2535,8 @@ app.get(
           batchSize;
 
 
-        /*
-         * 비정상적인 무한 조회 방지
-         */
-
         if (
-          allRounds.length >=
+          from >=
           100000
         ) {
           break;
@@ -2004,30 +2545,22 @@ app.get(
       }
 
 
-      /* ---------------------------------------
-         중복 제거
-      --------------------------------------- */
-
       const rounds =
         [
           ...new Set(
-            allRounds
+            allRows
 
               .map(
-                (item) =>
-                  String(
-                    item.round || ""
-                  ).trim()
+                (row) =>
+                  cleanWeflabString(
+                    row.round
+                  )
               )
 
               .filter(Boolean)
           ),
         ];
 
-
-      /* ---------------------------------------
-         자연스러운 회차 정렬
-      --------------------------------------- */
 
       rounds.sort(
         (a, b) =>
@@ -2056,7 +2589,7 @@ app.get(
     } catch (error) {
 
       console.error(
-        "❌ Weflab 회차 목록 조회 오류:",
+        "❌ Weflab 회차 조회 오류:",
         error
       );
 
@@ -2067,7 +2600,7 @@ app.get(
           success: false,
 
           message:
-            "Weflab 회차 목록 조회에 실패했습니다.",
+            "회차 목록 조회에 실패했습니다.",
 
           error:
             error.message,
@@ -2080,19 +2613,16 @@ app.get(
 
 
 /* =========================================================
-   Weflab 데이터 페이지 조회
+   Weflab 페이지 조회
 ========================================================= */
 
 /*
  * GET /weflab-data
  *
  * 전체:
- *
  * /weflab-data?page=1&limit=500
  *
- *
- * 회차:
- *
+ * 특정 회차:
  * /weflab-data?page=1&limit=500&round=ARTS1회차
  */
 
@@ -2105,30 +2635,23 @@ app.get(
       const requestedPage =
         Number(
           req.query.page
-        ) || 1;
+        );
 
 
       const requestedLimit =
         Number(
           req.query.limit
-        ) ||
-        WEFLAB_DEFAULT_PAGE_SIZE;
-
-
-      const page =
-        Math.max(
-          Number.isSafeInteger(
-            requestedPage
-          )
-            ? requestedPage
-            : 1,
-          1
         );
 
 
-      /*
-       * 한 페이지 최대 1000개
-       */
+      const page =
+        Number.isSafeInteger(
+          requestedPage
+        ) &&
+        requestedPage > 0
+          ? requestedPage
+          : 1;
+
 
       const limit =
         Math.min(
@@ -2138,6 +2661,7 @@ app.get(
             )
               ? requestedLimit
               : WEFLAB_DEFAULT_PAGE_SIZE,
+
             1
           ),
 
@@ -2156,20 +2680,11 @@ app.get(
         1;
 
 
-      /* ---------------------------------------
-         회차 필터
-      --------------------------------------- */
-
       const round =
-        String(
-          req.query.round ||
-          ""
-        ).trim();
+        cleanWeflabString(
+          req.query.round
+        );
 
-
-      /* ---------------------------------------
-         기본 Query
-      --------------------------------------- */
 
       let query =
         supabase
@@ -2179,17 +2694,23 @@ app.get(
           )
 
           .select(
-            "id,event_time,nickname,text,amount,round,created_at",
+            [
+              "id",
+              "event_time",
+              "nickname",
+              "donation_value",
+              "text",
+              "member",
+              "amount",
+              "round",
+              "created_at",
+            ].join(","),
             {
               count:
                 "exact",
             }
           );
 
-
-      /* ---------------------------------------
-         회차 선택
-      --------------------------------------- */
 
       if (round) {
 
@@ -2201,10 +2722,6 @@ app.get(
 
       }
 
-
-      /* ---------------------------------------
-         정렬 + 페이지 범위
-      --------------------------------------- */
 
       query =
         query
@@ -2265,7 +2782,8 @@ app.get(
           success: true,
 
           round:
-            round || null,
+            round ||
+            null,
 
           page,
 
@@ -2317,23 +2835,17 @@ app.get(
 
 
 /* =========================================================
-   Weflab 전체 데이터 조회
+   Weflab 전체 조회
 ========================================================= */
 
 /*
  * GET /weflab-data/all
  *
- * 전체 회차:
- *
+ * 전체:
  * /weflab-data/all
  *
- *
- * 특정 회차:
- *
+ * 회차:
  * /weflab-data/all?round=ARTS1회차
- *
- *
- * DB에서 1000개씩 반복 조회합니다.
  */
 
 app.get(
@@ -2346,20 +2858,15 @@ app.get(
         1000;
 
 
+      const round =
+        cleanWeflabString(
+          req.query.round
+        );
+
+
       let from = 0;
 
       let allData = [];
-
-
-      /* ---------------------------------------
-         회차 필터
-      --------------------------------------- */
-
-      const round =
-        String(
-          req.query.round ||
-          ""
-        ).trim();
 
 
       while (true) {
@@ -2370,10 +2877,6 @@ app.get(
           1;
 
 
-        /* ---------------------------------------
-           Query 생성
-        --------------------------------------- */
-
         let query =
           supabase
 
@@ -2382,13 +2885,19 @@ app.get(
             )
 
             .select(
-              "id,event_time,nickname,text,amount,round,created_at"
+              [
+                "id",
+                "event_time",
+                "nickname",
+                "donation_value",
+                "text",
+                "member",
+                "amount",
+                "round",
+                "created_at",
+              ].join(",")
             );
 
-
-        /* ---------------------------------------
-           특정 회차
-        --------------------------------------- */
 
         if (round) {
 
@@ -2400,10 +2909,6 @@ app.get(
 
         }
 
-
-        /* ---------------------------------------
-           정렬 + 범위
-        --------------------------------------- */
 
         query =
           query
@@ -2451,11 +2956,6 @@ app.get(
           );
 
 
-        /*
-         * 1000개보다 적게 왔다 =
-         * 마지막 페이지
-         */
-
         if (
           rows.length <
           batchSize
@@ -2467,10 +2967,6 @@ app.get(
         from +=
           batchSize;
 
-
-        /*
-         * 메모리 보호
-         */
 
         if (
           allData.length >=
@@ -2486,7 +2982,8 @@ app.get(
                 "데이터가 100,000개 이상입니다. 페이지 조회를 사용해주세요.",
 
               round:
-                round || null,
+                round ||
+                null,
 
               loaded:
                 allData.length,
@@ -2503,7 +3000,8 @@ app.get(
           success: true,
 
           round:
-            round || null,
+            round ||
+            null,
 
           count:
             allData.length,
@@ -2543,7 +3041,7 @@ app.get(
 ========================================================= */
 
 /*
- * GET /weflab-data/123
+ * GET /weflab-data/1
  */
 
 app.get(
@@ -2587,7 +3085,17 @@ app.get(
         )
 
         .select(
-          "id,event_time,nickname,text,amount,round,created_at"
+          [
+            "id",
+            "event_time",
+            "nickname",
+            "donation_value",
+            "text",
+            "member",
+            "amount",
+            "round",
+            "created_at",
+          ].join(",")
         )
 
         .eq(
@@ -2649,15 +3157,6 @@ app.get(
 
   }
 );
-
-
-
-
-
-
-
-
-
 
 
 /* =========================================================

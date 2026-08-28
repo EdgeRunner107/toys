@@ -1292,6 +1292,111 @@ app.patch(
 
 
 
+/* =========================================================
+   Weflab 공통 함수
+========================================================= */
+
+/**
+ * 회차 추출
+ *
+ * 지원:
+ * {
+ *   round: "ARTS1회차"
+ * }
+ *
+ * {
+ *   회차: "ARTS1회차"
+ * }
+ *
+ * {
+ *   회차명: "ARTS1회차"
+ * }
+ *
+ * 엑셀 마지막 컬럼에 ARTS1회차가 있을 경우도 보조적으로 탐색
+ */
+function extractWeflabRound(row) {
+  if (
+    !row ||
+    typeof row !== "object"
+  ) {
+    return "";
+  }
+
+
+  /* ---------------------------------------
+     명시적인 컬럼명 우선
+  --------------------------------------- */
+
+  const candidates = [
+    row.round,
+    row["회차"],
+    row["회차명"],
+    row.round_name,
+    row.roundName,
+  ];
+
+
+  for (const value of candidates) {
+    if (
+      value !== null &&
+      value !== undefined &&
+      String(value).trim()
+    ) {
+      return String(value).trim();
+    }
+  }
+
+
+  /* ---------------------------------------
+     마지막 컬럼 보조 탐색
+
+     예:
+     ARTS1회차
+     로벤저스1회차
+     1회차
+  --------------------------------------- */
+
+  const values =
+    Object.values(row);
+
+
+  for (
+    let i = values.length - 1;
+    i >= 0;
+    i -= 1
+  ) {
+    const value =
+      values[i];
+
+
+    if (
+      value === null ||
+      value === undefined
+    ) {
+      continue;
+    }
+
+
+    const text =
+      String(value).trim();
+
+
+    if (!text) {
+      continue;
+    }
+
+
+    if (
+      text.includes("회차")
+    ) {
+      return text;
+    }
+  }
+
+
+  return "";
+}
+
 
 /* =========================================================
    Weflab 데이터 저장 API
@@ -1312,14 +1417,30 @@ app.patch(
  * {
  *   "data": [...]
  * }
+ *
+ *
+ * 예:
+ *
+ * {
+ *   "시간": "2026-03-27 16:26:30",
+ *   "이름": "근이는하리★<br>(ldgcd)",
+ *   "후원,구독": "1,015개",
+ *   "채팅": "달리",
+ *   "멤버": "달리",
+ *   "마지막숫자": 1015,
+ *   "회차": "ARTS1회차"
+ * }
  */
 
 app.post(
   "/weflab-data",
   async (req, res) => {
+
     try {
+
       const body =
         req.body;
+
 
       let rows = [];
 
@@ -1328,40 +1449,65 @@ app.post(
          요청 데이터 형식 확인
       --------------------------------------- */
 
-      if (Array.isArray(body)) {
-        rows = body;
+      if (
+        Array.isArray(body)
+      ) {
+
+        rows =
+          body;
+
       }
 
       else if (
         body &&
-        Array.isArray(body.data)
+        Array.isArray(
+          body.data
+        )
       ) {
+
         rows =
           body.data;
+
       }
 
       else if (
         body &&
         typeof body === "object"
       ) {
-        rows = [body];
+
+        rows = [
+          body
+        ];
+
       }
 
       else {
-        return res.status(400).json({
-          success: false,
-          message:
-            "JSON 객체 또는 배열을 보내주세요.",
-        });
+
+        return res
+          .status(400)
+          .json({
+            success: false,
+
+            message:
+              "JSON 객체 또는 배열을 보내주세요.",
+          });
+
       }
 
 
-      if (rows.length === 0) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "저장할 데이터가 없습니다.",
-        });
+      if (
+        rows.length === 0
+      ) {
+
+        return res
+          .status(400)
+          .json({
+            success: false,
+
+            message:
+              "저장할 데이터가 없습니다.",
+          });
+
       }
 
 
@@ -1379,46 +1525,128 @@ app.post(
         index < rows.length;
         index += 1
       ) {
+
+        const sourceRow =
+          rows[index];
+
+
+        /*
+         * 기존 Weflab 파싱 함수
+         *
+         * 반환 예:
+         *
+         * {
+         *   valid: true,
+         *   data: {
+         *     event_time,
+         *     nickname,
+         *     text,
+         *     amount,
+         *     dedupe_key
+         *   }
+         * }
+         */
+
         const result =
           parseWeflabRow(
-            rows[index]
+            sourceRow
           );
 
 
-        if (!result.valid) {
+        if (
+          !result.valid
+        ) {
+
           skippedRows.push({
             index,
+
             reason:
               result.reason,
           });
 
           continue;
+
         }
 
 
+        /* ---------------------------------------
+           회차 추출
+        --------------------------------------- */
+
+        const round =
+          extractWeflabRound(
+            sourceRow
+          );
+
+
+        if (!round) {
+
+          skippedRows.push({
+            index,
+
+            reason:
+              "회차 정보가 없습니다.",
+          });
+
+          continue;
+
+        }
+
+
+        /* ---------------------------------------
+           저장 데이터 생성
+        --------------------------------------- */
+
+        const parsedData = {
+          ...result.data,
+
+          round,
+        };
+
+
+        /*
+         * 기존 dedupe_key는
+         *
+         * 시간 + 닉네임 + 채팅 + 금액
+         *
+         * 기반이므로 다른 회차에서 똑같은 후원이
+         * 발생하면 중복으로 처리될 수 있습니다.
+         *
+         * 따라서 회차를 dedupe_key 앞에 추가합니다.
+         */
+
+        parsedData.dedupe_key =
+          `${round}|${result.data.dedupe_key}`;
+
+
         parsedRows.push(
-          result.data
+          parsedData
         );
+
       }
 
 
       if (
         parsedRows.length === 0
       ) {
-        return res.status(400).json({
-          success: false,
 
-          message:
-            "저장 가능한 데이터가 없습니다.",
+        return res
+          .status(400)
+          .json({
+            success: false,
 
-          received:
-            rows.length,
+            message:
+              "저장 가능한 데이터가 없습니다.",
 
-          skipped:
-            skippedRows.length,
+            received:
+              rows.length,
 
-          skippedRows,
-        });
+            skipped:
+              skippedRows.length,
+
+            skippedRows,
+          });
+
       }
 
 
@@ -1433,10 +1661,12 @@ app.post(
       for (
         const row of parsedRows
       ) {
+
         uniqueMap.set(
           row.dedupe_key,
           row
         );
+
       }
 
 
@@ -1473,8 +1703,11 @@ app.post(
         batchIndex < batches.length;
         batchIndex += 1
       ) {
+
         const batch =
-          batches[batchIndex];
+          batches[
+            batchIndex
+          ];
 
 
         const {
@@ -1498,11 +1731,12 @@ app.post(
           )
 
           .select(
-            "id,event_time,nickname,text,amount,created_at"
+            "id,event_time,nickname,text,amount,round,created_at"
           );
 
 
         if (error) {
+
           console.error(
             `❌ Weflab 배치 ${
               batchIndex + 1
@@ -1540,6 +1774,7 @@ app.post(
                 error.code ||
                 null,
             });
+
         }
 
 
@@ -1567,6 +1802,7 @@ app.post(
           returned:
             returnedCount,
         });
+
       }
 
 
@@ -1629,6 +1865,7 @@ app.post(
         });
 
     } catch (error) {
+
       console.error(
         "❌ Weflab 저장 오류:",
         error
@@ -1646,7 +1883,198 @@ app.post(
           error:
             error.message,
         });
+
     }
+
+  }
+);
+
+
+/* =========================================================
+   Weflab 회차 목록 조회
+========================================================= */
+
+/*
+ * GET /weflab-rounds
+ *
+ * 응답:
+ *
+ * {
+ *   success: true,
+ *   count: 2,
+ *   data: [
+ *     "ARTS1회차",
+ *     "ARTS2회차"
+ *   ]
+ * }
+ */
+
+app.get(
+  "/weflab-rounds",
+  async (req, res) => {
+
+    try {
+
+      /*
+       * Supabase/PostgREST는 기본적으로
+       * 한 요청에 최대 1000행 제한이 있을 수 있으므로
+       * 1000건씩 전체 round를 가져옵니다.
+       */
+
+      const batchSize =
+        1000;
+
+
+      let from = 0;
+
+      let allRounds = [];
+
+
+      while (true) {
+
+        const to =
+          from +
+          batchSize -
+          1;
+
+
+        const {
+          data,
+          error,
+        } = await supabase
+
+          .from(
+            "weflab_donations"
+          )
+
+          .select(
+            "round"
+          )
+
+          .not(
+            "round",
+            "is",
+            null
+          )
+
+          .range(
+            from,
+            to
+          );
+
+
+        if (error) {
+          throw error;
+        }
+
+
+        const rows =
+          data || [];
+
+
+        allRounds =
+          allRounds.concat(
+            rows
+          );
+
+
+        if (
+          rows.length <
+          batchSize
+        ) {
+          break;
+        }
+
+
+        from +=
+          batchSize;
+
+
+        /*
+         * 비정상적인 무한 조회 방지
+         */
+
+        if (
+          allRounds.length >=
+          100000
+        ) {
+          break;
+        }
+
+      }
+
+
+      /* ---------------------------------------
+         중복 제거
+      --------------------------------------- */
+
+      const rounds =
+        [
+          ...new Set(
+            allRounds
+
+              .map(
+                (item) =>
+                  String(
+                    item.round || ""
+                  ).trim()
+              )
+
+              .filter(Boolean)
+          ),
+        ];
+
+
+      /* ---------------------------------------
+         자연스러운 회차 정렬
+      --------------------------------------- */
+
+      rounds.sort(
+        (a, b) =>
+          a.localeCompare(
+            b,
+            "ko-KR",
+            {
+              numeric: true,
+            }
+          )
+      );
+
+
+      return res
+        .status(200)
+        .json({
+          success: true,
+
+          count:
+            rounds.length,
+
+          data:
+            rounds,
+        });
+
+    } catch (error) {
+
+      console.error(
+        "❌ Weflab 회차 목록 조회 오류:",
+        error
+      );
+
+
+      return res
+        .status(500)
+        .json({
+          success: false,
+
+          message:
+            "Weflab 회차 목록 조회에 실패했습니다.",
+
+          error:
+            error.message,
+        });
+
+    }
+
   }
 );
 
@@ -1658,16 +2086,22 @@ app.post(
 /*
  * GET /weflab-data
  *
- * 예:
+ * 전체:
  *
  * /weflab-data?page=1&limit=500
- * /weflab-data?page=2&limit=500
+ *
+ *
+ * 회차:
+ *
+ * /weflab-data?page=1&limit=500&round=ARTS1회차
  */
 
 app.get(
   "/weflab-data",
   async (req, res) => {
+
     try {
+
       const requestedPage =
         Number(
           req.query.page
@@ -1695,6 +2129,7 @@ app.get(
       /*
        * 한 페이지 최대 1000개
        */
+
       const limit =
         Math.min(
           Math.max(
@@ -1721,49 +2156,86 @@ app.get(
         1;
 
 
+      /* ---------------------------------------
+         회차 필터
+      --------------------------------------- */
+
+      const round =
+        String(
+          req.query.round ||
+          ""
+        ).trim();
+
+
+      /* ---------------------------------------
+         기본 Query
+      --------------------------------------- */
+
+      let query =
+        supabase
+
+          .from(
+            "weflab_donations"
+          )
+
+          .select(
+            "id,event_time,nickname,text,amount,round,created_at",
+            {
+              count:
+                "exact",
+            }
+          );
+
+
+      /* ---------------------------------------
+         회차 선택
+      --------------------------------------- */
+
+      if (round) {
+
+        query =
+          query.eq(
+            "round",
+            round
+          );
+
+      }
+
+
+      /* ---------------------------------------
+         정렬 + 페이지 범위
+      --------------------------------------- */
+
+      query =
+        query
+
+          .order(
+            "event_time",
+            {
+              ascending:
+                true,
+            }
+          )
+
+          .order(
+            "id",
+            {
+              ascending:
+                true,
+            }
+          )
+
+          .range(
+            from,
+            to
+          );
+
+
       const {
         data,
         error,
         count,
-      } = await supabase
-
-        .from(
-          "weflab_donations"
-        )
-
-        .select(
-          "id,event_time,nickname,text,amount,created_at",
-          {
-            count: "exact",
-          }
-        )
-
-        /*
-         * 시간순
-         */
-        .order(
-          "event_time",
-          {
-            ascending:
-              true,
-          }
-        )
-
-        /*
-         * 같은 시간일 경우 ID 순
-         */
-        .order(
-          "id",
-          {
-            ascending:
-              true,
-          }
-        )
-
-        .range(
-          from,
-          to
-        );
+      } = await query;
 
 
       if (error) {
@@ -1792,6 +2264,9 @@ app.get(
         .json({
           success: true,
 
+          round:
+            round || null,
+
           page,
 
           limit,
@@ -1816,6 +2291,7 @@ app.get(
         });
 
     } catch (error) {
+
       console.error(
         "❌ Weflab 조회 오류:",
         error
@@ -1833,7 +2309,9 @@ app.get(
           error:
             error.message,
         });
+
     }
+
   }
 );
 
@@ -1845,61 +2323,117 @@ app.get(
 /*
  * GET /weflab-data/all
  *
- * DB에서 1000개씩 반복해서 전체 조회합니다.
+ * 전체 회차:
+ *
+ * /weflab-data/all
+ *
+ *
+ * 특정 회차:
+ *
+ * /weflab-data/all?round=ARTS1회차
+ *
+ *
+ * DB에서 1000개씩 반복 조회합니다.
  */
 
 app.get(
   "/weflab-data/all",
   async (req, res) => {
+
     try {
+
       const batchSize =
         1000;
+
 
       let from = 0;
 
       let allData = [];
 
 
+      /* ---------------------------------------
+         회차 필터
+      --------------------------------------- */
+
+      const round =
+        String(
+          req.query.round ||
+          ""
+        ).trim();
+
+
       while (true) {
+
         const to =
           from +
           batchSize -
           1;
 
 
+        /* ---------------------------------------
+           Query 생성
+        --------------------------------------- */
+
+        let query =
+          supabase
+
+            .from(
+              "weflab_donations"
+            )
+
+            .select(
+              "id,event_time,nickname,text,amount,round,created_at"
+            );
+
+
+        /* ---------------------------------------
+           특정 회차
+        --------------------------------------- */
+
+        if (round) {
+
+          query =
+            query.eq(
+              "round",
+              round
+            );
+
+        }
+
+
+        /* ---------------------------------------
+           정렬 + 범위
+        --------------------------------------- */
+
+        query =
+          query
+
+            .order(
+              "event_time",
+              {
+                ascending:
+                  true,
+              }
+            )
+
+            .order(
+              "id",
+              {
+                ascending:
+                  true,
+              }
+            )
+
+            .range(
+              from,
+              to
+            );
+
+
         const {
           data,
           error,
-        } = await supabase
-
-          .from(
-            "weflab_donations"
-          )
-
-          .select(
-            "id,event_time,nickname,text,amount,created_at"
-          )
-
-          .order(
-            "event_time",
-            {
-              ascending:
-                true,
-            }
-          )
-
-          .order(
-            "id",
-            {
-              ascending:
-                true,
-            }
-          )
-
-          .range(
-            from,
-            to
-          );
+        } = await query;
 
 
         if (error) {
@@ -1921,6 +2455,7 @@ app.get(
          * 1000개보다 적게 왔다 =
          * 마지막 페이지
          */
+
         if (
           rows.length <
           batchSize
@@ -1936,10 +2471,12 @@ app.get(
         /*
          * 메모리 보호
          */
+
         if (
           allData.length >=
           100000
         ) {
+
           return res
             .status(413)
             .json({
@@ -1948,10 +2485,15 @@ app.get(
               message:
                 "데이터가 100,000개 이상입니다. 페이지 조회를 사용해주세요.",
 
+              round:
+                round || null,
+
               loaded:
                 allData.length,
             });
+
         }
+
       }
 
 
@@ -1959,6 +2501,9 @@ app.get(
         .status(200)
         .json({
           success: true,
+
+          round:
+            round || null,
 
           count:
             allData.length,
@@ -1968,6 +2513,7 @@ app.get(
         });
 
     } catch (error) {
+
       console.error(
         "❌ Weflab 전체 조회 오류:",
         error
@@ -1985,7 +2531,9 @@ app.get(
           error:
             error.message,
         });
+
     }
+
   }
 );
 
@@ -1994,10 +2542,16 @@ app.get(
    Weflab 특정 데이터 조회
 ========================================================= */
 
+/*
+ * GET /weflab-data/123
+ */
+
 app.get(
   "/weflab-data/:id",
   async (req, res) => {
+
     try {
+
       const id =
         Number(
           req.params.id
@@ -2005,9 +2559,12 @@ app.get(
 
 
       if (
-        !Number.isSafeInteger(id) ||
+        !Number.isSafeInteger(
+          id
+        ) ||
         id <= 0
       ) {
+
         return res
           .status(400)
           .json({
@@ -2016,6 +2573,7 @@ app.get(
             message:
               "올바른 ID가 아닙니다.",
           });
+
       }
 
 
@@ -2029,7 +2587,7 @@ app.get(
         )
 
         .select(
-          "id,event_time,nickname,text,amount,created_at"
+          "id,event_time,nickname,text,amount,round,created_at"
         )
 
         .eq(
@@ -2046,6 +2604,7 @@ app.get(
 
 
       if (!data) {
+
         return res
           .status(404)
           .json({
@@ -2054,6 +2613,7 @@ app.get(
             message:
               "해당 Weflab 데이터를 찾을 수 없습니다.",
           });
+
       }
 
 
@@ -2061,10 +2621,12 @@ app.get(
         .status(200)
         .json({
           success: true,
+
           data,
         });
 
     } catch (error) {
+
       console.error(
         "❌ Weflab 상세 조회 오류:",
         error
@@ -2082,18 +2644,11 @@ app.get(
           error:
             error.message,
         });
+
     }
+
   }
 );
-
-
-
-
-
-
-
-
-
 
 
 
